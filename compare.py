@@ -9,10 +9,15 @@ import argparse
 import heapq
 import sys
 import tempfile
+import time
 from contextlib import ExitStack
 from itertools import groupby
 from pathlib import Path
 from typing import Iterator, Optional
+
+
+def _progress(msg: str) -> None:
+    print(f"      {msg}", file=sys.stderr, flush=True)
 
 
 def iter_lines(path: Path, encoding: str, ignore_empty: bool) -> Iterator[str]:
@@ -39,17 +44,34 @@ def sort_to_chunks(
     tmp_dir: Path,
     chunk_bytes: int,
     label: str,
+    phase_start: Optional[float] = None,
+    report_every: int = 1_000_000,
 ) -> tuple[list[Path], int]:
     chunks: list[Path] = []
     buffer: list[str] = []
     buffer_bytes = 0
     total = 0
+    bytes_read = 0
+    start = phase_start if phase_start is not None else time.monotonic()
     for line in lines:
         buffer.append(line)
-        buffer_bytes += 50 + len(line)
+        line_cost = 60 + len(line)
+        buffer_bytes += line_cost
+        bytes_read += len(line) + 1
         total += 1
+        if total % report_every == 0:
+            elapsed = time.monotonic() - start
+            _progress(
+                f"{label}: {total:,} 행 처리, 청크 {len(chunks)}개 spill, "
+                f"{bytes_read / (1024 * 1024):.1f} MB 읽음, 경과 {elapsed:.1f}s"
+            )
         if buffer_bytes >= chunk_bytes:
             chunks.append(_flush_chunk(buffer, tmp_dir, label, len(chunks)))
+            elapsed = time.monotonic() - start
+            _progress(
+                f"{label}: 청크 {len(chunks)} spill "
+                f"({bytes_read / (1024 * 1024):.1f} MB까지, 경과 {elapsed:.1f}s)"
+            )
             buffer = []
             buffer_bytes = 0
     if buffer:
@@ -149,21 +171,32 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="filecmp_", dir=tmp_parent) as tmp:
         tmp_path = Path(tmp)
 
-        print(f"[1/3] 외부 정렬: A = {args.file_a}", file=sys.stderr)
+        print(f"[1/3] 외부 정렬: A = {args.file_a}", file=sys.stderr, flush=True)
+        phase_start = time.monotonic()
         chunks_a, total_a = sort_to_chunks(
             iter_lines(args.file_a, args.encoding, ignore_empty),
-            tmp_path, chunk_bytes, "a",
+            tmp_path, chunk_bytes, "A",
+            phase_start=phase_start,
         )
-        print(f"      청크 {len(chunks_a)}개, {total_a:,} 행", file=sys.stderr)
+        elapsed_a = time.monotonic() - phase_start
+        _progress(
+            f"A 완료: 청크 {len(chunks_a)}개, {total_a:,} 행, 경과 {elapsed_a:.1f}s"
+        )
 
-        print(f"[2/3] 외부 정렬: B = {args.file_b}", file=sys.stderr)
+        print(f"[2/3] 외부 정렬: B = {args.file_b}", file=sys.stderr, flush=True)
+        phase_start = time.monotonic()
         chunks_b, total_b = sort_to_chunks(
             iter_lines(args.file_b, args.encoding, ignore_empty),
-            tmp_path, chunk_bytes, "b",
+            tmp_path, chunk_bytes, "B",
+            phase_start=phase_start,
         )
-        print(f"      청크 {len(chunks_b)}개, {total_b:,} 행", file=sys.stderr)
+        elapsed_b = time.monotonic() - phase_start
+        _progress(
+            f"B 완료: 청크 {len(chunks_b)}개, {total_b:,} 행, 경과 {elapsed_b:.1f}s"
+        )
 
-        print("[3/3] 머지 비교 중...", file=sys.stderr)
+        print("[3/3] 머지 비교 중...", file=sys.stderr, flush=True)
+        phase_start = time.monotonic()
 
         common_count = 0
         only_a_count = 0
@@ -182,6 +215,8 @@ def main() -> int:
             runs_a = grouped(merge_chunks(chunks_a))
             runs_b = grouped(merge_chunks(chunks_b))
 
+            merge_report_every = 1_000_000
+            next_report = merge_report_every
             for kind, line, count in diff_streams(runs_a, runs_b):
                 if kind == "common":
                     common_count += count
@@ -197,6 +232,16 @@ def main() -> int:
                     _write_diff(fb, line, count)
                     if len(preview_b) < args.preview:
                         preview_b.append((line, count))
+                processed = common_count + only_a_count + only_b_count
+                if processed >= next_report:
+                    elapsed = time.monotonic() - phase_start
+                    _progress(
+                        f"머지 진행: {processed:,} 행 비교, 경과 {elapsed:.1f}s"
+                    )
+                    next_report = processed - (processed % merge_report_every) + merge_report_every
+
+        elapsed_merge = time.monotonic() - phase_start
+        _progress(f"머지 완료: 경과 {elapsed_merge:.1f}s")
 
     print()
     print(f"파일 A: {args.file_a}  ({total_a:,} 행)")
